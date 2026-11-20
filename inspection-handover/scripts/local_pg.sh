@@ -89,6 +89,7 @@ case "${1:-}" in
     status)
         "$PGBIN/psql" "$old_dsn" -c "SELECT 'old' AS db, count(*) FROM work_orders"
         "$PGBIN/psql" "$new_dsn" -c "SELECT 'new' AS db, count(*) FROM work_orders"
+        "$PGBIN/psql" "$new_dsn" -c "SELECT 'new-quarantine' AS db, count(*) FROM work_orders_quarantine"
         "$PGBIN/psql" "$new_dsn" -c "SELECT subname, subenabled FROM pg_subscription"
         ;;
     *) echo "usage: $0 init|start|stop|clean|status"; exit 1 ;;

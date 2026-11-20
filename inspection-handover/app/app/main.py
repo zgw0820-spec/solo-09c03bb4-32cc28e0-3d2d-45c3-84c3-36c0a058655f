@@ -1,18 +1,21 @@
-"""FastAPI 入口：工单提交/查询、交接、订阅暂停恢复，以及演示网页。"""
+"""FastAPI 入口：工单提交/查询、交接、订阅暂停恢复、撞号隔离，以及演示网页。"""
 from fastapi import FastAPI, HTTPException
+from fastapi.encoders import jsonable_encoder
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 from . import db
 from .config import get_settings
 from .cutover import CutoverError, CutoverManager
+from .quarantine import QuarantineError, QuarantineManager
 from .state import StateStore
 
 settings = get_settings()
 store = StateStore(settings.state_db_path)
 manager = CutoverManager(settings, store)
+quarantine_manager = QuarantineManager(settings, store)
 
-app = FastAPI(title="巡检工单库交接", version="1.0")
+app = FastAPI(title="巡检工单库交接", version="1.1")
 
 
 class WorkOrderIn(BaseModel):
@@ -22,6 +25,21 @@ class WorkOrderIn(BaseModel):
 
 class CutoverRequest(BaseModel):
     confirm: bool = False
+
+
+class TrialWorkOrderIn(BaseModel):
+    title: str = Field(min_length=1, max_length=200)
+    detail: str = Field(default="", max_length=2000)
+    explicit_id: int | None = Field(default=None, ge=1)
+
+
+class CompareRequest(BaseModel):
+    work_order_id: int = Field(ge=1)
+
+
+class ConfirmQuarantineRequest(BaseModel):
+    work_order_id: int = Field(ge=1)
+    confirm_token: str = Field(min_length=1, max_length=128)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -117,6 +135,77 @@ def events() -> list:
     return store.list_events()
 
 
+# ---- 撞号隔离交接 ------------------------------------------------------
+@app.post("/api/trial-work-orders")
+def create_trial_work_order(payload: TrialWorkOrderIn) -> dict:
+    """在新库写本地试写件。仅旧库接单期间允许（试写是为撞号对照准备的）。"""
+    if manager.current_state() != "OLD":
+        raise HTTPException(
+            status_code=409,
+            detail=f"试写只能在旧库接单期间进行（当前状态 {manager.current_state()}）",
+        )
+    try:
+        row = db.insert_trial_work_order(
+            settings.new_dsn, payload.title, payload.detail, payload.explicit_id
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"试写失败: {exc}") from exc
+    store.log_event(
+        "QUARANTINE",
+        f"新库本地试写件已写入：工单号 {row['id']}（source_db=new-trial，不参与复制）",
+        {"work_order_id": row["id"], "explicit_id": payload.explicit_id},
+    )
+    return {"trial_work_order": row, "confirm_token": db.row_confirm_token(row)}
+
+
+@app.get("/api/quarantine/compare")
+def quarantine_compare(work_order_id: int) -> dict:
+    """交接页按工单号对照两库原文（GET，供页面直接查询）。"""
+    try:
+        return quarantine_manager.compare(work_order_id)
+    except QuarantineError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
+
+
+@app.post("/api/quarantine/confirm")
+def quarantine_confirm(payload: ConfirmQuarantineRequest) -> JSONResponse:
+    """确认隔离：试写件原样入隔离表并移出工单表，两步一事务；重复确认幂等。"""
+    try:
+        result = quarantine_manager.confirm(payload.work_order_id, payload.confirm_token)
+    except QuarantineError as exc:
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"ok": False, "error": exc.message},
+        )
+    return JSONResponse(content=jsonable_encoder({"ok": True, **result}))
+
+
+@app.get("/api/quarantine/list")
+def quarantine_list() -> dict:
+    """网页显示隔离的原件（隔离表只在新库）。"""
+    return {"quarantined": jsonable_encoder(db.list_quarantined(settings.new_dsn))}
+
+
+@app.post("/api/demo/seed-collision")
+def demo_seed_collision() -> dict:
+    """灌入本地演示数据：新库试写件 2000 + 旧库同一事务提交 2000/2001（2000 撞号）。"""
+    if manager.current_state() != "OLD":
+        raise HTTPException(
+            status_code=409,
+            detail=f"演示数据只能在旧库接单期间灌入（当前状态 {manager.current_state()}）",
+        )
+    try:
+        result = db.seed_demo_collision(settings.old_dsn, settings.new_dsn)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"演示数据灌入失败: {exc}") from exc
+    store.log_event(
+        "QUARANTINE",
+        "已灌入撞号演示数据：新库试写件 2000；旧库同一事务提交工单 2000、2001",
+        {"skipped": result["skipped"]},
+    )
+    return result
+
+
 PAGE_HTML = """<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -179,6 +268,38 @@ PAGE_HTML = """<!DOCTYPE html>
   </div>
 </div>
 
+<div class="card" style="border-color:#f59e0b;">
+  <h2 style="margin-top:0">撞号隔离交接（仅旧库接单期间可提交）</h2>
+  <div style="margin-bottom:10px">
+    <button class="warn" onclick="seedDemo()">灌入演示数据（新库试写件 2000；旧库同事务 2000+2001，2000 撞号）</button>
+    <button class="muted" onclick="createTrial()">新库写本地试写件（序列发号）</button>
+  </div>
+  <label>按工单号对照两库原文</label>
+  <div style="display:flex; gap:8px;">
+    <input id="cmpid" style="margin:0" placeholder="例如：2000" value="2000">
+    <button class="primary" style="white-space:nowrap" onclick="compareOrder()">对照</button>
+  </div>
+  <div id="cmpmsg"></div>
+  <div class="grid" style="margin-top:10px">
+    <div>
+      <strong>旧库原文（发布端，须已有同号工单）</strong>
+      <pre id="oldcmp" style="max-height:180px">（未对照）</pre>
+    </div>
+    <div>
+      <strong>新库原文（订阅端，须仍是本地试写版本）</strong>
+      <pre id="newcmp" style="max-height:180px">（未对照）</pre>
+    </div>
+  </div>
+  <div style="margin-top:8px">
+    <button class="ok" onclick="confirmQuarantine()">确认隔离（原样入隔离表并移出工单表，一事务提交）</button>
+    <span id="tokinfo" style="font-size:12px;color:#64748b"></span>
+  </div>
+  <div id="qmsg"></div>
+  <h2 style="margin-top:18px">隔离表原件（新库 work_orders_quarantine）</h2>
+  <table><thead><tr><th>编号</th><th>标题</th><th>来源</th><th>试写时间</th><th>隔离时间</th><th>撞号来源</th></tr></thead>
+  <tbody id="qrows"></tbody></table>
+</div>
+
 <div class="card">
   <h2 style="margin-top:0">交接事件日志</h2>
   <pre id="events"></pre>
@@ -203,6 +324,7 @@ async function refresh(){
   fillRows('oldrows', w.old); fillRows('newrows', w.new);
   document.getElementById('oldsum').textContent = '行数/最大号: ' + w.old_summary.count_max.join(' / ');
   document.getElementById('newsum').textContent = '行数/最大号: ' + w.new_summary.count_max.join(' / ');
+  loadQuarantine();
   const ev = await (await fetch('/api/events')).json();
   document.getElementById('events').textContent =
     ev.map(e => new Date(e.ts*1000).toLocaleTimeString() + ' [' + e.phase + '] ' + e.message).join('\\n') || '（暂无）';
@@ -255,6 +377,87 @@ async function resumeSub(){
   show(document.getElementById('msg'), r.ok ? '订阅已恢复，积压数据将开始追平' : '操作失败', r.ok ? '#047857' : '#b91c1c');
   refresh();
 }
+
+// ---- 撞号隔离 ----
+let currentToken = null;
+function pretty(obj){ return obj ? JSON.stringify(obj, null, 2) : '（无记录）'; }
+
+async function seedDemo(){
+  const r = await fetch('/api/demo/seed-collision', { method:'POST' });
+  const d = await r.json();
+  show(document.getElementById('qmsg'), r.ok
+    ? '演示数据已就绪（重复灌入会跳过已存在部分）：' + JSON.stringify(d.skipped.length ? d.skipped : '全部新建')
+    : '灌入失败：' + (d.detail || r.status), r.ok ? '#047857' : '#b91c1c');
+  refresh();
+}
+
+async function createTrial(){
+  const r = await fetch('/api/trial-work-orders', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ title: '值班员新库试写件 ' + new Date().toLocaleTimeString(), detail: '本地试写，不参与逻辑复制' })
+  });
+  const d = await r.json();
+  show(document.getElementById('qmsg'), r.ok
+    ? '试写件已写入新库，工单号 ' + d.trial_work_order.id + '（source_db=new-trial）'
+    : '试写失败：' + (d.detail || r.status), r.ok ? '#047857' : '#b91c1c');
+  refresh();
+}
+
+async function compareOrder(){
+  const id = document.getElementById('cmpid').value.trim();
+  if(!id){ show(document.getElementById('cmpmsg'), '请输入工单号', '#b91c1c'); return; }
+  const r = await fetch('/api/quarantine/compare?work_order_id=' + encodeURIComponent(id));
+  const d = await r.json();
+  if(!r.ok){ show(document.getElementById('cmpmsg'), '对照失败：' + (d.detail || r.status), '#b91c1c'); return; }
+  document.getElementById('oldcmp').textContent = pretty(d.old);
+  document.getElementById('newcmp').textContent = d.already_quarantined
+    ? '该工单号已隔离，原件见下方隔离表（重复确认将返回原隔离结果）' : pretty(d.new_trial);
+  currentToken = d.confirm_token;
+  document.getElementById('tokinfo').textContent =
+    '版本令牌：' + (currentToken ? currentToken.slice(0, 16) + '…' : '无');
+  if(d.already_quarantined){
+    show(document.getElementById('cmpmsg'), '该工单号已隔离，重复确认幂等返回原结果', '#047857');
+  } else if(d.eligible){
+    show(document.getElementById('cmpmsg'), '前置条件满足：旧库有同号工单，新库仍是本地试写件，可确认隔离', '#047857');
+  } else {
+    show(document.getElementById('cmpmsg'), '不满足隔离条件：' + d.reasons.join('；'), '#b91c1c');
+  }
+}
+
+async function confirmQuarantine(){
+  const id = document.getElementById('cmpid').value.trim();
+  if(!id){ show(document.getElementById('qmsg'), '请先输入并对照工单号', '#b91c1c'); return; }
+  // 未对照过则先对照取令牌
+  if(!currentToken){ await compareOrder(); }
+  if(!currentToken){ show(document.getElementById('qmsg'), '没有可用的版本令牌，请先对照', '#b91c1c'); return; }
+  if(!confirm('确认把工单号 ' + id + ' 的新库试写件原样隔离并移出工单表？')) return;
+  const r = await fetch('/api/quarantine/confirm', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ work_order_id: Number(id), confirm_token: currentToken })
+  });
+  const d = await r.json();
+  if(r.ok && d.ok){
+    show(document.getElementById('qmsg'),
+      (d.idempotent ? '重复确认：返回原隔离结果（幂等，未改动工单表）' : '隔离成功，两步已在同一事务提交')
+      + '；订阅开关：' + (d.subscription_enabled_after ? '启用（PostgreSQL 将自动重试旧库整笔事务）' : '暂停'),
+      '#047857');
+    currentToken = null;
+  } else {
+    show(document.getElementById('qmsg'), '隔离被拒绝（已回滚，数据未改动）：' + (d.error || r.status), '#b91c1c');
+  }
+  refresh();
+}
+
+async function loadQuarantine(){
+  const d = await (await fetch('/api/quarantine/list')).json();
+  document.getElementById('qrows').innerHTML = (d.quarantined || []).map(r =>
+    '<tr><td>' + r.id + '</td><td>' + escapeHtml(r.title) + '</td><td>' + r.source_db +
+    '</td><td>' + new Date(r.created_at).toLocaleString() +
+    '</td><td>' + new Date(r.quarantined_at).toLocaleString() +
+    '</td><td>' + escapeHtml(r.collided_source_db) + '</td></tr>').join('')
+    || '<tr><td colspan="6">（暂无隔离件）</td></tr>';
+}
+
 refresh(); setInterval(refresh, 4000);
 </script>
 </body>

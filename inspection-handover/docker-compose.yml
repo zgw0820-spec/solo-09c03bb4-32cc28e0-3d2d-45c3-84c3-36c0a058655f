@@ -66,6 +66,8 @@ services:
       - "8000:8000"
     volumes:
       - app-data:/data
+      # 演示数据脚本挂入容器：docker compose exec app python -I /scripts/local_seed_demo.py
+      - ./scripts:/scripts:ro
     depends_on:
       old-db:
         condition: service_healthy
